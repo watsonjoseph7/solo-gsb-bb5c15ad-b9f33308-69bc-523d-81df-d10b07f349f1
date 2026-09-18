@@ -14,6 +14,9 @@ from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
     CompareIntervalOut,
+    CorrectionForkLeaf,
+    CorrectionForkOut,
+    CorrectionForksOut,
     EffectiveEvent,
     EventBatchIn,
     EventChangeOut,
@@ -26,6 +29,7 @@ from .schemas import (
     LeaderboardOut,
     LeaderboardPageOut,
     ParticipantCompareOut,
+    ParticipantTotal,
     RankPosition,
     RewardPreviewIn,
     RewardPreviewOut,
@@ -758,6 +762,92 @@ def participant_compare(
         to_revision=to_revision,
         intervals=intervals,
     )
+
+
+def correction_forks(revision: Optional[int]) -> CorrectionForksOut:
+    """Correction chains that contain a fork at the snapshot ``revision``.
+
+    Read-only audit view. The snapshot restores the correction relations of
+    all events with ``revision <= R``; the effective rule matches
+    ``/leaderboard`` — an event counts iff it exists at R and no correction
+    existing at R supersedes it — so a chain's effective events are exactly
+    the leaves of its correction tree. A chain is reported iff some event in
+    it has at least two direct corrections within the snapshot; plain linear
+    chains are omitted. Corrections chained below a fork stay on their own
+    branch, so each branch contributes only its leaf. ``revision`` defaults
+    to the latest; 0 denotes the empty ledger (no forks).
+    """
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if revision is None:
+            revision = max_rev
+        elif revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {revision} not found"
+            )
+        rows = conn.execute(
+            "SELECT * FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (revision,),
+        ).fetchall()
+
+    by_id = {r["event_id"]: r for r in rows}
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for r in rows:
+        if r["correction_of"] is None:
+            roots.append(r["event_id"])
+        else:
+            children.setdefault(r["correction_of"], []).append(r["event_id"])
+
+    forks: list[CorrectionForkOut] = []
+    for root in sorted(roots):
+        # Walk the whole correction tree of this root. correction_of targets
+        # always carry smaller revisions, so the walk is acyclic and stays
+        # inside the snapshot.
+        paths: list[list[str]] = []  # root-to-leaf event_id paths
+        has_fork = False
+        stack: list[Tuple[str, list[str]]] = [(root, [root])]
+        while stack:
+            event_id, path = stack.pop()
+            kids = children.get(event_id, [])
+            if len(kids) >= 2:
+                has_fork = True
+            if not kids:
+                paths.append(path)
+            else:
+                stack.extend((kid, path + [kid]) for kid in kids)
+        if not has_fork:
+            continue
+        leaf_rows = sorted(
+            (by_id[path[-1]] for path in paths),
+            key=lambda r: (r["revision"], r["event_id"]),
+        )
+        path_by_leaf = {path[-1]: path for path in paths}
+        totals: dict[str, int] = {}
+        for r in leaf_rows:
+            pid = r["participant_id"]
+            totals[pid] = totals.get(pid, 0) + r["points"]
+        forks.append(
+            CorrectionForkOut(
+                chain_root=root,
+                leaves=[
+                    CorrectionForkLeaf(
+                        path=path_by_leaf[r["event_id"]],
+                        participant_id=r["participant_id"],
+                        points=r["points"],
+                        revision=r["revision"],
+                    )
+                    for r in leaf_rows
+                ],
+                participant_totals=[
+                    ParticipantTotal(participant_id=pid, total_points=total)
+                    for pid, total in sorted(totals.items())
+                ],
+            )
+        )
+    return CorrectionForksOut(revision=revision, forks=forks)
 
 
 def rewards_preview(preview: RewardPreviewIn) -> RewardPreviewOut:

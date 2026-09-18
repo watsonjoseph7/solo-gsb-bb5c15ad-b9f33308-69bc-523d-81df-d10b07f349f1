@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query, Response, status
 from . import ledger
 from .db import init_db
 from .schemas import (
+    CorrectionForksOut,
     EventBatchIn,
     EventChangesOut,
     EventIn,
@@ -222,6 +223,25 @@ def get_score_breakdown(
     ),
 ) -> ScoreBreakdownOut:
     return ledger.score_breakdown(participant_id, revision)
+
+
+@app.get(
+    "/audit/correction-forks",
+    response_model=CorrectionForksOut,
+    responses={
+        404: {"description": "Revision beyond the current maximum"},
+        422: {"description": "Negative/non-integer revision"},
+    },
+)
+def get_correction_forks(
+    revision: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Snapshot revision; defaults to the latest. "
+        "0 means the empty ledger.",
+    )
+) -> CorrectionForksOut:
+    return ledger.correction_forks(revision)
 
 
 @app.post(

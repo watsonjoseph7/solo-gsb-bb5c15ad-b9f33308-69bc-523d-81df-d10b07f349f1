@@ -178,6 +178,44 @@ class ParticipantCompareOut(BaseModel):
     intervals: List[CompareIntervalOut]
 
 
+class CorrectionForkLeaf(BaseModel):
+    """One effective leaf (branch tip) of a forked correction chain."""
+
+    path: List[str] = Field(
+        description="event_ids from the chain root to this leaf, root first."
+    )
+    participant_id: str
+    points: int
+    revision: int
+
+
+class ParticipantTotal(BaseModel):
+    """Effective points summed over one participant within a chain."""
+
+    participant_id: str
+    total_points: int
+
+
+class CorrectionForkOut(BaseModel):
+    """One correction chain that contains a fork at the snapshot revision."""
+
+    chain_root: str = Field(
+        description="event_id of the correction-chain root."
+    )
+    leaves: List[CorrectionForkLeaf] = Field(
+        description="Effective branch tips, sorted by (revision, event_id)."
+    )
+    participant_totals: List[ParticipantTotal] = Field(
+        description="Effective leaf points summed per participant, "
+        "sorted by participant_id."
+    )
+
+
+class CorrectionForksOut(BaseModel):
+    revision: int
+    forks: List[CorrectionForkOut]
+
+
 class RewardPreviewIn(BaseModel):
     """Request body for ``POST /rewards/preview`` (read-only dry run)."""
 
