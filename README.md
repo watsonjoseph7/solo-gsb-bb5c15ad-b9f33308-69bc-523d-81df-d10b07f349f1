@@ -8,6 +8,7 @@
 - **更正链**：更正事件通过 `correction_of` 引用已有事件（或同批更早的事件），更正本身可被再次更正（链式）。任一 revision 上，每条更正链只计**当时的末端事件**。
 - **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细。
 - **奖励结算预演**：`POST /rewards/preview` 按指定 revision 的排行榜只读试算奖金分配——并列组共享合并后的奖金池、余数按 `participant_id` 升序分配，不写入账本。
+- **更正分叉审计**：`GET /audit/correction-forks?revision=` 按指定快照还原更正关系，仅返回存在分叉（同一事件被两个及以上事件直接更正）的更正链，列出根到各生效叶子的完整路径与按参赛者汇总的生效积分；只读，普通线性链不返回。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
 
 ## 快速启动
@@ -414,6 +415,55 @@ bob 与 carol 并列，组覆盖第 2～3 名，奖金池 500+250=750 由两人�
 }
 ```
 
+### 更正分叉审计 `GET /audit/correction-forks`
+
+按指定快照还原全部更正关系，审计**更正分叉**：快照内同一事件被至少两个事件**直接更正**即构成分叉（链上每个事件最多有一个 `correction_of` 父节点，因此更正关系是一片森林；分叉点即拥有 ≥2 个子节点的事件）。分叉之后的链式更正仍归入各自分支；每个节点至多一个直接更正的**普通线性链不返回**，独立事件也不返回。
+
+| 查询参数 | 说明 |
+|---|---|
+| `revision` | 可选。固定快照 revision，默认当前；允许传 `0` 表示空账本（返回空数组）；超过当前最大 revision 返回 `404`，负数或非整数返回 `422` |
+
+- 生效规则与 `/leaderboard` 一致：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正 `c.correction_of = e.event_id`；分叉链的每个分支只计该快照上的**生效叶子**（被更正的根与中间节点都不计）；
+- 响应仅包含**存在分叉的链根**，按 `chain_root` 升序；
+- 每项含：
+  - `chain_root`：链根 `event_id`（沿 `correction_of` 上溯到的、自身未更正任何事件的起点）；
+  - `leaves`：从根到每个生效叶子的完整 `event_id` 路径 `path`（含根与叶子，按 revision 升序），以及叶子的 `participant_id`、`points`、`revision`；叶子按 `revision`、再按 `event_id` 升序；
+  - `participant_points`：该链生效叶子按 `participant_id` 汇总的积分（同一参赛者在多个分支持有的叶子积分相加；被取代的根/中间节点不参与），按 `participant_id` 升序；
+- 接口**只读**，不写入账本、不产生新 revision。
+
+```bash
+# 构造分叉：e1 同时被 e2、e3 更正，e3 又被 e4 链式更正（归入 e3 分支）
+curl -X POST localhost:8000/events/batch -H 'Content-Type: application/json' -d '[
+  {"event_id":"e1","participant_id":"alice","points":10},
+  {"event_id":"e2","participant_id":"alice","points":12,"correction_of":"e1"},
+  {"event_id":"e3","participant_id":"alice","points":20,"correction_of":"e1"},
+  {"event_id":"e4","participant_id":"bob","points":25,"correction_of":"e3"}
+]'
+
+curl localhost:8000/audit/correction-forks
+```
+
+```json
+{
+  "revision": 4,
+  "forks": [
+    {
+      "chain_root": "e1",
+      "leaves": [
+        {"path": ["e1", "e2"], "participant_id": "alice", "points": 12, "revision": 2},
+        {"path": ["e1", "e3", "e4"], "participant_id": "bob", "points": 25, "revision": 4}
+      ],
+      "participant_points": [
+        {"participant_id": "alice", "total_points": 12},
+        {"participant_id": "bob", "total_points": 25}
+      ]
+    }
+  ]
+}
+```
+
+空账本或 `revision=0` 返回 `{"revision": 0, "forks": []}`；快照中尚不存在分叉（例如分叉的第二个分支写入之前）时 `forks` 同样为空。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
@@ -446,7 +496,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本）。
 
 ## 设计要点
 
@@ -455,6 +505,7 @@ pytest -v
 - **批量原子性**：`/events/batch` 在单个 `BEGIN IMMEDIATE` 事务内完成重复/冲突检查、引用校验与全部插入；`correction_of` 仅可指向库中事件或同批更早下标。revision 取锁内 `MAX(revision)+1` 后按数组顺序连续分配，任何失败均回滚，不留下事件也不消耗 revision。
 - **生效判定**：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正事件 `c.correction_of = e.event_id`。
 - **事件差异**：`/events/changes` 复用同一生效判定取两个快照的生效事件，沿 `correction_of` 上溯到链根后按链根归组；同链根下相同 `event_id` 抵消，剩余一进一出合并为 `replaced`，否则逐项记 `added`/`removed`，按 `(chain_root, after/before 的 revision, event_id)` 排序。
+- **分叉审计**：`/audit/correction-forks` 在单个读快照内取出 `revision ≤ R` 的全部事件并建立 `correction_of` 森林；任一事件在快照内有 ≥2 个直接更正（子节点）即为分叉，收集其链根。每个分叉链列出全部无后任的节点（即各分支生效叶子，与 `/leaderboard` 生效判定一致）及沿父链回溯的根→叶完整路径，并把叶子积分按 `participant_id` 汇总；无分叉的线性链不输出。纯读，默认最新，0 为空快照，超范围 404。
 - **积分归因**：`/participants/{participant_id}/score-breakdown` 在单个读快照内取 `revision ≤ R` 的全部事件，未被更正的事件即各链生效末端；属于目标参赛者的末端沿 `correction_of` 上溯到链根，生成 `(chain_root, effective_event, history)` 三元组，按链根 `event_id` 升序输出；`total_points` 为各生效末端积分之和，与 `/leaderboard` 同 revision 的总分一致。
 - **双方对比**：`/participants/compare` 在单个读快照内取出 `revision ≤ to_revision` 的全部事件后按 revision 升序**重放**一次：事件写入即生效（更正的 revision 必然更大），被**首个**直接更正取代时失效——因此更正改挂参赛者时，原归属方扣分与新归属方加分落在同一个 revision 上；分叉更正只扣一次。重放经过 `[from_revision, to_revision]` 内每个 revision 时记录双方总分，相邻且双方分数都相同的快照合并为闭区间，与逐 revision 调用 `/leaderboard` 的结果一致。
 - **奖励预演**：`/rewards/preview` 复用 `/leaderboard` 的生效判定与排序，在单个读快照内计算指定 revision 的排行榜（纯读，不写账本）。总分相同者按 `participant_id` 升序构成并列组，覆盖连续名次区间；组与有奖区（第 1～N 名，N 为奖金数组长度）有交集时，将组覆盖的区内名次奖金合并为全组奖金池均分，余数分币按 `participant_id` 升序每人 1 分——发放总额恒等于奖金池。

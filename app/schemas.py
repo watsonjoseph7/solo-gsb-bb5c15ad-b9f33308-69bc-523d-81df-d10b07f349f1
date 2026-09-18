@@ -131,6 +131,52 @@ class EventChangesOut(BaseModel):
     changes: List[EventChangeOut]
 
 
+class CorrectionForkLeafOut(BaseModel):
+    """One effective leaf of a forked correction chain."""
+
+    path: List[str] = Field(
+        description=(
+            "Complete event_id path from the chain root to this effective "
+            "leaf, ordered by revision ascending."
+        )
+    )
+    participant_id: str
+    points: int
+    revision: int
+
+
+class CorrectionForkParticipantPoints(BaseModel):
+    """Effective points of one forked chain summed for one participant."""
+
+    participant_id: str
+    total_points: int = Field(
+        description="Sum of the chain's effective-leaf points held by this participant."
+    )
+
+
+class CorrectionForkOut(BaseModel):
+    """A correction chain whose tree contains a fork at the snapshot revision."""
+
+    chain_root: str = Field(
+        description="event_id of the correction-chain root; the root event itself carries no correction_of."
+    )
+    leaves: List[CorrectionForkLeafOut] = Field(
+        description=(
+            "Effective leaves of every branch, sorted by leaf revision then event_id."
+        )
+    )
+    participant_points: List[CorrectionForkParticipantPoints] = Field(
+        description="Effective points of this chain summed per participant_id, ordered by participant_id."
+    )
+
+
+class CorrectionForksOut(BaseModel):
+    revision: int
+    forks: List[CorrectionForkOut] = Field(
+        description="Forked correction chains, sorted by chain_root."
+    )
+
+
 class ScoreContribution(BaseModel):
     """One correction chain's contribution to a participant's total."""
 

@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query, Response, status
 from . import ledger
 from .db import init_db
 from .schemas import (
+    CorrectionForksOut,
     EventBatchIn,
     EventChangesOut,
     EventIn,
@@ -124,6 +125,24 @@ def get_event_changes(
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: str) -> EventOut:
     return ledger.get_event(event_id)
+
+
+@app.get(
+    "/audit/correction-forks",
+    response_model=CorrectionForksOut,
+    responses={
+        404: {"description": "Revision beyond the current maximum"},
+        422: {"description": "Missing/non-integer or negative revision"},
+    },
+)
+def get_correction_forks(
+    revision: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Snapshot revision; defaults to the latest. 0 means the empty ledger.",
+    ),
+) -> CorrectionForksOut:
+    return ledger.correction_forks(revision)
 
 
 @app.get("/leaderboard", response_model=LeaderboardOut)

@@ -14,6 +14,10 @@ from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
     CompareIntervalOut,
+    CorrectionForkLeafOut,
+    CorrectionForkOut,
+    CorrectionForkParticipantPoints,
+    CorrectionForksOut,
     EffectiveEvent,
     EventBatchIn,
     EventChangeOut,
@@ -537,6 +541,101 @@ def event_changes(from_revision: int, to_revision: int) -> EventChangesOut:
         to_revision=to_revision,
         changes=changes,
     )
+
+
+def correction_forks(revision: Optional[int]) -> CorrectionForksOut:
+    """Correction chains that have forked as of ``revision``.
+
+    Restores every correction relationship existing at the snapshot
+    (``revision <= R``) and returns only chain roots whose tree contains a
+    fork: an event with at least two direct corrections in the snapshot. A
+    later chained correction still belongs to the branch it hangs off, so a
+    plain linear chain (each node at most one direct correction) is never
+    returned.
+
+    For each forked chain the output lists every *effective leaf* — a
+    snapshot event with no in-snapshot correction, matching the
+    ``/leaderboard`` effective rule — with the complete root-to-leaf
+    ``event_id`` path, the leaf's participant_id, points and revision, plus
+    the chain's effective points summed per participant_id across its
+    leaves. Read-only.
+
+    ``revision`` defaults to the latest; 0 denotes the empty ledger; a
+    revision beyond the current maximum is 404.
+    """
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if revision is None:
+            revision = max_rev
+        elif revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {revision} not found"
+            )
+        if revision == 0:
+            return CorrectionForksOut(revision=0, forks=[])
+        rows = conn.execute(
+            "SELECT * FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (revision,),
+        ).fetchall()
+
+    by_id: dict[str, sqlite3.Row] = {r["event_id"]: r for r in rows}
+    children: dict[str, list[str]] = {}
+    for r in rows:
+        if r["correction_of"] is not None:
+            children.setdefault(r["correction_of"], []).append(r["event_id"])
+
+    def root_of(event_id: str) -> str:
+        while by_id[event_id]["correction_of"] is not None:
+            event_id = by_id[event_id]["correction_of"]
+        return event_id
+
+    # A fork is any in-snapshot event with >= 2 direct corrections; collect
+    # the roots of every chain containing one.
+    forked_roots = {
+        root_of(event_id) for event_id, kids in children.items() if len(kids) >= 2
+    }
+
+    forks: list[CorrectionForkOut] = []
+    for root in sorted(forked_roots):
+        leaves: list[CorrectionForkLeafOut] = []
+        totals: dict[str, int] = {}
+        for r in rows:
+            if r["event_id"] in children:  # has a direct correction in the snapshot
+                continue
+            # Effective leaf: walk correction_of up to the root; targets
+            # always exist with smaller revisions, so the walk stays in the
+            # snapshot and terminates.
+            path_ids = [r["event_id"]]
+            while by_id[path_ids[-1]]["correction_of"] is not None:
+                path_ids.append(by_id[path_ids[-1]]["correction_of"])
+            path_ids.reverse()
+            if path_ids[0] != root:
+                continue
+            leaves.append(
+                CorrectionForkLeafOut(
+                    path=path_ids,
+                    participant_id=r["participant_id"],
+                    points=r["points"],
+                    revision=r["revision"],
+                )
+            )
+            pid = r["participant_id"]
+            totals[pid] = totals.get(pid, 0) + r["points"]
+        leaves.sort(key=lambda leaf: (leaf.revision, leaf.path[-1]))
+        participant_points = [
+            CorrectionForkParticipantPoints(participant_id=pid, total_points=total)
+            for pid, total in sorted(totals.items())
+        ]
+        forks.append(
+            CorrectionForkOut(
+                chain_root=root,
+                leaves=leaves,
+                participant_points=participant_points,
+            )
+        )
+    return CorrectionForksOut(revision=revision, forks=forks)
 
 
 def leaderboard_page(
